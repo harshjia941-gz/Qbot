@@ -24,12 +24,25 @@ from qbot.gui.widgets.widget_web import WebPanel
 
 import re
 from datetime import datetime
+import importlib
 
 import akshare as ak
+import backtrader as bt
+import numpy as np
 import pandas as pd
 import yfinance as yf
-from pyecharts.charts import Kline
+from pyecharts.charts import Kline, Line
 from pyecharts import options as opts
+
+
+# Strategy registry: map display name → (module_path, class_name)
+STRATEGY_REGISTRY = {
+    "单因子-相对强弱指数RSI": ("qbot.strategies.rsi_strategy_bt", "RSIStrategy"),
+    "单因子-简单移动均线": ("qbot.strategies.sma_cross_strategy_bt", "SmaCross"),
+    "单因子-布林线均值回归": ("qbot.strategies.boll_strategy_bt", "BollStrategy"),
+    "机器学习-麻雀优化算法SSA": ("qbot.strategies.ssa_strategy_bt", "MyStrategy"),
+    "多因子-ROC(20)动量信号周频Top1": ("qbot.strategies.multi_strategy_bt", "MultiStrategy"),
+}
 
 
 # https://zhuanlan.zhihu.com/p/376248349
@@ -473,7 +486,7 @@ class PanelBacktest(wx.Panel):
             border=2,
         )
         # self.stock_strategy_cbox.Bind(wx.EVT_RADIOBUTTON, self._ev_src_choose)
-        # self.stock_strategy_cbox.Bind(wx.EVT_COMBOBOX, self._on_combobox_strategy_changed)
+        self.stock_strategy_cbox.Bind(wx.EVT_COMBOBOX, self._on_combobox_strategy_changed)
         select_strategy = self.stock_strategy_cbox.GetStringSelection()
         self.backtest_opts["select_strategy"] = select_strategy
         logger.debug(f"select_strategy: {select_strategy}")
@@ -614,10 +627,198 @@ class PanelBacktest(wx.Panel):
         pass
 
     def StartBacktest(self, event):
-        msg = "在线回测属于付费功能，请联系微信：Yida_Zhang2"
-        MessageDialog(msg)
-        print(msg)
-        pass
+        """Run backtrader backtest with selected strategy and loaded data."""
+        # 1. Check data loaded
+        if not hasattr(self, 'stock_dat') or self.stock_dat is None or self.stock_dat.empty:
+            MessageDialog("请先加载行情数据")
+            return
+
+        # 2. Get params from UI
+        strategy_name = self.backtest_opts.get("select_strategy", "")
+        code = self.backtest_opts.get("code", "unknown")
+        try:
+            init_cash = float(self.init_cash_input.GetValue())
+            stake = int(self.init_stake_input.GetValue())
+            commission = float(self.init_commission_input.GetValue())
+            slippage_val = float(self.init_slippage_input.GetValue())
+            stamp_duty = float(self.init_tax_input.GetValue())
+        except ValueError as e:
+            MessageDialog(f"回测参数错误: {e}")
+            return
+
+        # 3. Resolve strategy class
+        if strategy_name not in STRATEGY_REGISTRY:
+            MessageDialog(f"该策略尚未实现: {strategy_name}")
+            return
+
+        module_path, class_name = STRATEGY_REGISTRY[strategy_name]
+        try:
+            mod = importlib.import_module(module_path)
+            strategy_class = getattr(mod, class_name)
+        except (ImportError, AttributeError) as e:
+            MessageDialog(f"加载策略失败: {e}")
+            return
+
+        try:
+            # 4. Prepare data for backtrader
+            df = self.stock_dat.copy()
+            df.index = pd.to_datetime(df["Date"])
+            if hasattr(df.index, 'tz') and df.index.tz is not None:
+                df.index = df.index.tz_localize(None)
+            df_bt = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+            df_bt.columns = [c.lower() for c in df_bt.columns]
+            df_bt["openinterest"] = 0
+
+            start_date = df.index.min().to_pydatetime()
+            end_date = df.index.max().to_pydatetime()
+
+            data = bt.feeds.PandasData(
+                dataname=df_bt,
+                fromdate=start_date,
+                todate=end_date,
+            )
+
+            # 5. Setup Cerebro
+            cerebro = bt.Cerebro(stdstats=True)
+            cerebro.adddata(data)
+            cerebro.addstrategy(strategy_class)
+            cerebro.broker.setcash(init_cash)
+            # Combined commission (trading fee + stamp duty)
+            cerebro.broker.setcommission(commission=commission + stamp_duty)
+            # Use percentage sizer: invest 95% of available cash per trade
+            # This avoids the "can't afford 100 shares" problem
+            cerebro.addsizer(bt.sizers.PercentSizer, percents=95)
+            if slippage_val > 0:
+                cerebro.broker.set_slippage_perc(perc=slippage_val / 100)
+
+            # Add observers for equity curve tracking
+            cerebro.addobserver(bt.observers.Value)
+
+            # Add analyzers
+            cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe', riskfreerate=0.04)
+            cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trades')
+            cerebro.addanalyzer(bt.analyzers.TimeReturn, _name='timereturn')
+
+            # 6. Run backtest
+            logger.info(f"Starting backtest: {code}, strategy={strategy_name}, cash={init_cash}")
+            results = cerebro.run()
+            strat = results[0]
+            final_value = cerebro.broker.getvalue()
+            pnl = final_value - init_cash
+            pnl_pct = (pnl / init_cash) * 100
+
+            # Extract analyzers
+            sharpe_result = strat.analyzers.sharpe.get_analysis()
+            sharpe_ratio = sharpe_result.get('sharperatio', None)
+            if sharpe_ratio is None:
+                sharpe_ratio = sharpe_result.get('sharpe_ratio', 'N/A')
+
+            # Trade stats
+            trade_analysis = strat.analyzers.trades.get_analysis()
+            total_trades = trade_analysis.get('total', {}).get('total', 0)
+            won = trade_analysis.get('won', {}).get('total', 0)
+            lost = trade_analysis.get('lost', {}).get('total', 0)
+
+            # Warn if no trades
+            if total_trades == 0:
+                MessageDialog(
+                    f"回测完成但无交易产生\n\n"
+                    f"策略 {strategy_name} 在该时间段内未触发买卖信号。\n"
+                    f"可能原因：\n"
+                    f"1. 数据日期范围太短\n"
+                    f"2. 股票趋势太强，未出现超买/超卖\n\n"
+                    f"建议：扩大日期范围或换一只波动更大的股票"
+                )
+                return
+
+            # 7. Build equity curve from TimeReturn analyzer
+            time_returns = strat.analyzers.timereturn.get_analysis()
+            dates = df.index.tolist()
+            equity_curve = [init_cash]
+            for i, dt_key in enumerate(sorted(time_returns.keys())):
+                if i < len(dates) - 1:
+                    equity_curve.append(equity_curve[-1] * (1 + time_returns[dt_key]))
+            # Pad if needed
+            while len(equity_curve) < len(dates):
+                equity_curve.append(equity_curve[-1])
+            equity_curve = equity_curve[:len(dates)]
+
+            date_labels = [d.strftime('%Y-%m-%d') for d in dates]
+
+            # Also build benchmark (buy & hold) curve
+            benchmark_curve = []
+            first_close = float(df.iloc[0]["Close"])
+            for i in range(len(dates)):
+                bm_val = init_cash * float(df.iloc[i]["Close"]) / first_close
+                benchmark_curve.append(round(bm_val, 2))
+
+            # Create pyecharts line chart
+            line = Line()
+            line.add_xaxis(date_labels)
+            line.add_yaxis(
+                "策略净值",
+                [round(v, 2) for v in equity_curve],
+                is_smooth=True,
+                linestyle_opts=opts.LineStyleOpts(width=2),
+                label_opts=opts.LabelOpts(is_show=False),
+                areastyle_opts=opts.AreaStyleOpts(opacity=0.3),
+            )
+            line.add_yaxis(
+                "基准(Buy&Hold)",
+                benchmark_curve,
+                is_smooth=True,
+                linestyle_opts=opts.LineStyleOpts(width=2),
+                label_opts=opts.LabelOpts(is_show=False),
+            )
+            line.set_global_opts(
+                title_opts=opts.TitleOpts(
+                    title=f"{code} 回测结果 — {strategy_name}",
+                    subtitle=(
+                        f"初始: {init_cash:,.0f} → 期末: {final_value:,.2f} | "
+                        f"收益: {pnl:+,.2f} ({pnl_pct:+.2f}%) | "
+                        f"交易: {total_trades}次 (胜{won}/负{lost}) | Sharpe: {sharpe_ratio}"
+                    ),
+                ),
+                xaxis_opts=opts.AxisOpts(
+                    type_="category",
+                    axislabel_opts=opts.LabelOpts(rotate=45),
+                ),
+                yaxis_opts=opts.AxisOpts(type_="value"),
+                datazoom_opts=[
+                    opts.DataZoomOpts(range_start=0, range_end=100),
+                    opts.DataZoomOpts(type_="inside", range_start=0, range_end=100),
+                ],
+                tooltip_opts=opts.TooltipOpts(trigger="axis"),
+                legend_opts=opts.LegendOpts(),
+            )
+
+            html_path = DATA_DIR_BKT_RESULT.joinpath(f"{code}_backtest_result.html")
+            line.render(str(html_path))
+            logger.info(f"Backtest result saved to {html_path}")
+
+            # 8. Display in WebPanel
+            self.BackWebPanel.show_file(str(html_path))
+
+            # 9. Show summary dialog
+            sharpe_str = f"{sharpe_ratio:.4f}" if isinstance(sharpe_ratio, (int, float)) else str(sharpe_ratio)
+            summary = (
+                f"回测完成\n\n"
+                f"策略: {strategy_name}\n"
+                f"标的: {code}\n"
+                f"初始资金: {init_cash:,.0f}\n"
+                f"期末资金: {final_value:,.2f}\n"
+                f"收益: {pnl:+,.2f} ({pnl_pct:+.2f}%)\n"
+                f"交易次数: {total_trades} (胜{won}/负{lost})\n"
+                f"Sharpe Ratio: {sharpe_str}"
+            )
+            MessageDialog(summary)
+            logger.info(f"Backtest done: PnL={pnl:+,.2f} ({pnl_pct:+.2f}%), trades={total_trades}")
+
+        except Exception as e:
+            logger.error(f"StartBacktest error: {e}")
+            import traceback
+            traceback.print_exc()
+            MessageDialog(f"回测出错: {str(e)}")
 
     def _is_chinese_stock(self, code):
         code_upper = code.upper()
