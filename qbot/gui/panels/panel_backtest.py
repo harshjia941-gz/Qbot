@@ -384,7 +384,7 @@ class PanelBacktest(wx.Panel):
             choices=["沪深300指数(000300.SH)", "标普500指数(SPX)", "恒生指数(HSI)"],
         )
         self.stock_benchmark_cbox.SetSelection(0)
-        # self.stock_benchmark_cbox.Bind(wx.EVT_COMBOBOX, self._on_combobox_benchmarks_changed)  # noqa: E501
+        self.stock_benchmark_cbox.Bind(wx.EVT_COMBOBOX, self._on_combobox_benchmarks_changed)  # noqa: E501
         self.select_benchmark = self.stock_benchmark_cbox.GetValue()
         self.benchmark_code = extract_content(self.select_benchmark)[0]
         logger.debug(f"select_benchmark: {self.benchmark_code}")
