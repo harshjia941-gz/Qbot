@@ -745,12 +745,46 @@ class PanelBacktest(wx.Panel):
 
             date_labels = [d.strftime('%Y-%m-%d') for d in dates]
 
-            # Also build benchmark (buy & hold) curve
-            benchmark_curve = []
-            first_close = float(df.iloc[0]["Close"])
-            for i in range(len(dates)):
-                bm_val = init_cash * float(df.iloc[i]["Close"]) / first_close
-                benchmark_curve.append(round(bm_val, 2))
+            # Build benchmark curve from user-selected index
+            benchmark_code = self.backtest_opts.get("benchmark", "000300.SH")
+            benchmark_name_map = {
+                "000300.SH": "沪深300", "SPX": "标普500", "HSI": "恒生指数"
+            }
+            benchmark_label = f"基准({benchmark_name_map.get(benchmark_code, benchmark_code)})"
+
+            start_dt_str = start_date.strftime("%Y%m%d")
+            end_dt_str = end_date.strftime("%Y%m%d")
+            index_closes = self._fetch_benchmark_index(
+                benchmark_code, start_dt_str, end_dt_str
+            )
+
+            if index_closes and len(index_closes) > 0:
+                first_index_close = float(index_closes[0])
+                if first_index_close == 0:
+                    first_index_close = 1.0
+                benchmark_curve = []
+                for i in range(len(dates)):
+                    if i < len(index_closes):
+                        bm_val = init_cash * float(index_closes[i]) / first_index_close
+                    else:
+                        bm_val = init_cash * float(index_closes[-1]) / first_index_close
+                    benchmark_curve.append(round(bm_val, 2))
+                logger.info(
+                    f"Benchmark curve from {benchmark_code}, "
+                    f"{len(index_closes)} points"
+                )
+            else:
+                # Fallback: stock buy-and-hold
+                benchmark_label = "基准(Buy&Hold — 指数数据获取失败)"
+                benchmark_curve = []
+                first_close = float(df.iloc[0]["Close"])
+                for i in range(len(dates)):
+                    bm_val = init_cash * float(df.iloc[i]["Close"]) / first_close
+                    benchmark_curve.append(round(bm_val, 2))
+                logger.warning(
+                    f"Benchmark {benchmark_code} fetch failed, "
+                    f"using stock B&H fallback"
+                )
 
             # Create pyecharts line chart
             line = Line()
@@ -764,7 +798,7 @@ class PanelBacktest(wx.Panel):
                 areastyle_opts=opts.AreaStyleOpts(opacity=0.3),
             )
             line.add_yaxis(
-                "基准(Buy&Hold)",
+                benchmark_label,
                 benchmark_curve,
                 is_smooth=True,
                 linestyle_opts=opts.LineStyleOpts(width=2),
@@ -970,6 +1004,60 @@ class PanelBacktest(wx.Panel):
         df.sort_values("Date", inplace=True)
         df.reset_index(drop=True, inplace=True)
         return df
+
+    def _fetch_benchmark_index(self, benchmark_code, start_time, end_time):
+        """Fetch benchmark index close prices for the given date range.
+        Returns list of close prices, or None on failure."""
+        try:
+            if benchmark_code == "000300.SH":
+                df = ak.stock_zh_index_daily(symbol="sh000300")
+                if df is None or df.empty:
+                    return None
+                date_col = "date" if "date" in df.columns else df.columns[0]
+                df[date_col] = pd.to_datetime(df[date_col])
+                start_dt = datetime.strptime(start_time, "%Y%m%d")
+                end_dt = datetime.strptime(end_time, "%Y%m%d")
+                mask = (df[date_col] >= start_dt) & (df[date_col] <= end_dt)
+                df = df[mask].sort_values(date_col)
+                # Find close column (akshare uses lowercase)
+                close_col = None
+                for c in df.columns:
+                    if str(c).lower() == "close":
+                        close_col = c
+                        break
+                if close_col is None:
+                    return None
+                return df[close_col].tolist()
+
+            elif benchmark_code in ("SPX", "HSI"):
+                ticker_map = {"SPX": "^GSPC", "HSI": "^HSI"}
+                ticker = ticker_map[benchmark_code]
+                start_dt = datetime.strptime(start_time, "%Y%m%d")
+                end_dt = datetime.strptime(end_time, "%Y%m%d")
+                df = yf.download(
+                    ticker,
+                    start=start_dt.strftime("%Y-%m-%d"),
+                    end=end_dt.strftime("%Y-%m-%d"),
+                    progress=False,
+                )
+                if df is None or df.empty:
+                    return None
+                # yfinance may return MultiIndex columns
+                if isinstance(df.columns, pd.MultiIndex):
+                    close_cols = [c for c in df.columns if c[0] == "Close"]
+                    close_col = close_cols[0] if close_cols else None
+                elif "Close" in df.columns:
+                    close_col = "Close"
+                else:
+                    close_col = None
+                if close_col is None:
+                    return None
+                return df[close_col].tolist()
+
+            return None
+        except Exception as e:
+            logger.warning(f"Failed to fetch benchmark {benchmark_code}: {e}")
+            return None
 
     def _generate_kline_html(self, df, code):
         dates = df["Date"].dt.strftime("%Y-%m-%d").tolist()
