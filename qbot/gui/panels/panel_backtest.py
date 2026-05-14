@@ -627,10 +627,20 @@ class PanelBacktest(wx.Panel):
             return True
         return False
 
+    def _is_hk_stock(self, code):
+        code_upper = code.upper()
+        if code_upper.endswith(".HK"):
+            return True
+        if re.match(r"^\d{4,5}$", code):
+            # 4-5 digit pure numbers likely HK stocks (e.g. 02513, 9992)
+            return True
+        return False
+
     def _strip_stock_suffix(self, code):
         code_upper = code.upper()
-        if code_upper.endswith(".SZ") or code_upper.endswith(".SH"):
-            return code_upper[:-3]
+        for suffix in (".SZ", ".SH", ".HK"):
+            if code_upper.endswith(suffix):
+                return code_upper[:-3]
         return code_upper
 
     def _map_period(self, period_str):
@@ -641,6 +651,24 @@ class PanelBacktest(wx.Panel):
         mapping = {"前复权": "qfq", "后复权": "hfq", "不复权": ""}
         return mapping.get(adjust_str, "")
 
+    def _fetch_with_retry(self, fetch_fn, max_retries=3, delay=2):
+        """Retry wrapper for unstable API calls."""
+        import time
+        last_err = None
+        for attempt in range(max_retries):
+            try:
+                df = fetch_fn()
+                if df is not None and not df.empty:
+                    return df
+            except Exception as e:
+                last_err = e
+                logger.warning(f"Fetch attempt {attempt+1}/{max_retries} failed: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(delay)
+        if last_err:
+            raise last_err
+        return None
+
     def _fetch_cn_stock(self, code, start_time, end_time):
         symbol = self._strip_stock_suffix(code)
         period = self._map_period(self.stock_period_cbox.GetValue())
@@ -649,13 +677,64 @@ class PanelBacktest(wx.Panel):
             f"Fetching CN stock: {symbol}, period={period}, "
             f"start={start_time}, end={end_time}, adjust={adjust}"
         )
-        df = ak.stock_zh_a_hist(
-            symbol=symbol, period=period,
-            start_date=start_time, end_date=end_time,
-            adjust=adjust,
-        )
+        def _do_fetch():
+            return ak.stock_zh_a_hist(
+                symbol=symbol, period=period,
+                start_date=start_time, end_date=end_time,
+                adjust=adjust,
+            )
+        df = self._fetch_with_retry(_do_fetch)
         if df is None or df.empty:
             return None
+        df.rename(
+            columns={
+                "日期": "Date", "开盘": "Open", "收盘": "Close",
+                "最高": "High", "最低": "Low", "成交量": "Volume",
+            },
+            inplace=True,
+        )
+        df["Date"] = pd.to_datetime(df["Date"])
+        for col in ["Open", "High", "Low", "Close"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df.sort_values("Date", inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        return df
+
+    def _fetch_hk_stock(self, code, start_time, end_time):
+        symbol = self._strip_stock_suffix(code)
+        # akshare HK stock uses 5-digit string e.g. "02513"
+        if len(symbol) < 5:
+            symbol = symbol.zfill(5)
+        period = self._map_period(self.stock_period_cbox.GetValue())
+        adjust = self._map_adjust(self.stock_authority_cbox.GetValue())
+        logger.info(
+            f"Fetching HK stock: {symbol}, period={period}, "
+            f"start={start_time}, end={end_time}, adjust={adjust}"
+        )
+        def _do_fetch():
+            return ak.stock_hk_hist(
+                symbol=symbol, period=period,
+                start_date=start_time, end_date=end_time,
+                adjust=adjust,
+            )
+        df = self._fetch_with_retry(_do_fetch)
+        if df is None or df.empty:
+            # Fallback: try yfinance with .HK suffix
+            logger.info(f"akshare HK failed, trying yfinance for {symbol}.HK")
+            ticker = yf.Ticker(f"{symbol}.HK")
+            start_dt = datetime.strptime(start_time, "%Y%m%d")
+            end_dt = datetime.strptime(end_time, "%Y%m%d")
+            df = ticker.history(start=start_dt.strftime("%Y-%m-%d"), end=end_dt.strftime("%Y-%m-%d"))
+            if df is None or df.empty:
+                return None
+            df.reset_index(inplace=True)
+            keep_cols = ["Date", "Open", "High", "Low", "Close", "Volume"]
+            df = df[[c for c in keep_cols if c in df.columns]]
+            if "Date" in df.columns and hasattr(df["Date"], "dt"):
+                df["Date"] = df["Date"].dt.tz_localize(None)
+            df.sort_values("Date", inplace=True)
+            df.reset_index(drop=True, inplace=True)
+            return df
         df.rename(
             columns={
                 "日期": "Date", "开盘": "Open", "收盘": "Close",
@@ -740,6 +819,8 @@ class PanelBacktest(wx.Panel):
         try:
             if self._is_chinese_stock(code):
                 df = self._fetch_cn_stock(code, start_time, end_time)
+            elif self._is_hk_stock(code):
+                df = self._fetch_hk_stock(code, start_time, end_time)
             else:
                 df = self._fetch_us_stock(code, start_time, end_time)
 
