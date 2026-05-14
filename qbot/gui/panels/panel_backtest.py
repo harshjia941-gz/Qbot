@@ -22,6 +22,15 @@ from qbot.gui.config import DATA_DIR_BKT_RESULT
 from qbot.gui.elements.def_dialog import MessageDialog
 from qbot.gui.widgets.widget_web import WebPanel
 
+import re
+from datetime import datetime
+
+import akshare as ak
+import pandas as pd
+import yfinance as yf
+from pyecharts.charts import Kline
+from pyecharts import options as opts
+
 
 # https://zhuanlan.zhihu.com/p/376248349
 def OnBkt(event):
@@ -610,8 +619,141 @@ class PanelBacktest(wx.Panel):
         print(msg)
         pass
 
+    def _is_chinese_stock(self, code):
+        code_upper = code.upper()
+        if code_upper.endswith(".SZ") or code_upper.endswith(".SH"):
+            return True
+        if re.match(r"^\d{6}$", code_upper):
+            return True
+        return False
+
+    def _strip_stock_suffix(self, code):
+        code_upper = code.upper()
+        if code_upper.endswith(".SZ") or code_upper.endswith(".SH"):
+            return code_upper[:-3]
+        return code_upper
+
+    def _map_period(self, period_str):
+        mapping = {"30分钟": "30", "60分钟": "60", "日线": "daily", "周线": "weekly"}
+        return mapping.get(period_str, "daily")
+
+    def _map_adjust(self, adjust_str):
+        mapping = {"前复权": "qfq", "后复权": "hfq", "不复权": ""}
+        return mapping.get(adjust_str, "")
+
+    def _fetch_cn_stock(self, code, start_time, end_time):
+        symbol = self._strip_stock_suffix(code)
+        period = self._map_period(self.stock_period_cbox.GetValue())
+        adjust = self._map_adjust(self.stock_authority_cbox.GetValue())
+        logger.info(
+            f"Fetching CN stock: {symbol}, period={period}, "
+            f"start={start_time}, end={end_time}, adjust={adjust}"
+        )
+        df = ak.stock_zh_a_hist(
+            symbol=symbol, period=period,
+            start_date=start_time, end_date=end_time,
+            adjust=adjust,
+        )
+        if df is None or df.empty:
+            return None
+        df.rename(
+            columns={
+                "日期": "Date", "开盘": "Open", "收盘": "Close",
+                "最高": "High", "最低": "Low", "成交量": "Volume",
+            },
+            inplace=True,
+        )
+        df["Date"] = pd.to_datetime(df["Date"])
+        for col in ["Open", "High", "Low", "Close"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df.sort_values("Date", inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        return df
+
+    def _fetch_us_stock(self, code, start_time, end_time):
+        start_dt = datetime.strptime(start_time, "%Y%m%d")
+        end_dt = datetime.strptime(end_time, "%Y%m%d")
+        start_str = start_dt.strftime("%Y-%m-%d")
+        end_str = end_dt.strftime("%Y-%m-%d")
+        logger.info(
+            f"Fetching US stock: {code}, start={start_str}, end={end_str}"
+        )
+        ticker = yf.Ticker(code)
+        df = ticker.history(start=start_str, end=end_str)
+        if df is None or df.empty:
+            return None
+        df.reset_index(inplace=True)
+        keep_cols = ["Date", "Open", "High", "Low", "Close", "Volume"]
+        df = df[[c for c in keep_cols if c in df.columns]]
+        if "Date" in df.columns and hasattr(df["Date"], "dt"):
+            df["Date"] = df["Date"].dt.tz_localize(None)
+        df.sort_values("Date", inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        return df
+
+    def _generate_kline_html(self, df, code):
+        dates = df["Date"].dt.strftime("%Y-%m-%d").tolist()
+        kline_data = []
+        for _, row in df.iterrows():
+            kline_data.append([
+                float(row["Open"]),
+                float(row["Close"]),
+                float(row["Low"]),
+                float(row["High"]),
+            ])
+
+        kline = Kline()
+        kline.add_xaxis(dates)
+        kline.add_yaxis(code, kline_data)
+        kline.set_global_opts(
+            title_opts=opts.TitleOpts(title=f"{code} K线图"),
+            xaxis_opts=opts.AxisOpts(
+                type_="category",
+                axislabel_opts=opts.LabelOpts(rotate=45),
+            ),
+            yaxis_opts=opts.AxisOpts(
+                type_="value",
+                splitarea_opts=opts.SplitAreaOpts(
+                    is_show=True, areastyle_opts=opts.AreaStyleOpts(opacity=1)
+                ),
+            ),
+            datazoom_opts=[
+                opts.DataZoomOpts(range_start=50, range_end=100),
+                opts.DataZoomOpts(type_="inside", range_start=50, range_end=100),
+            ],
+            tooltip_opts=opts.TooltipOpts(trigger="axis"),
+        )
+        html_path = DATA_DIR_BKT_RESULT.joinpath(f"{code}_kline.html")
+        kline.render(str(html_path))
+        logger.info(f"K-line chart saved to {html_path}")
+        return html_path
+
     def LoadData(self, event):
-        msg = "请联系微信：Yida_Zhang2 开通功能"
-        MessageDialog(msg)
-        print(msg)
-        pass
+        code = self.backtest_opts.get("code", "").strip()
+        start_time = self.backtest_opts.get("start_time", "")
+        end_time = self.backtest_opts.get("end_time", "")
+
+        if not code:
+            MessageDialog("请输入股票代码")
+            return
+
+        try:
+            if self._is_chinese_stock(code):
+                df = self._fetch_cn_stock(code, start_time, end_time)
+            else:
+                df = self._fetch_us_stock(code, start_time, end_time)
+
+            if df is None or df.empty:
+                MessageDialog(f"获取数据失败，请检查股票代码: {code}")
+                return
+
+            self.stock_dat = df
+
+            html_path = self._generate_kline_html(df, code)
+            self.BackWebPanel.show_file(str(html_path))
+
+            logger.info(f"成功加载 {code} 行情数据，共 {len(df)} 条记录")
+
+        except Exception as e:
+            logger.error(f"LoadData error: {e}")
+            MessageDialog(f"加载数据出错: {str(e)}")
