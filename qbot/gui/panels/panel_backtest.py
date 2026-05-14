@@ -758,32 +758,28 @@ class PanelBacktest(wx.Panel):
                 benchmark_code, start_dt_str, end_dt_str
             )
 
-            if index_closes and len(index_closes) > 0:
-                first_index_close = float(index_closes[0])
-                if first_index_close == 0:
-                    first_index_close = 1.0
-                benchmark_curve = []
-                for i in range(len(dates)):
-                    if i < len(index_closes):
-                        bm_val = init_cash * float(index_closes[i]) / first_index_close
-                    else:
-                        bm_val = init_cash * float(index_closes[-1]) / first_index_close
-                    benchmark_curve.append(round(bm_val, 2))
+            if index_closes is not None and len(index_closes) > 0:
+                stock_dates = df.index
+                # Align benchmark to stock calendar: reindex + forward fill
+                aligned = index_closes.reindex(stock_dates).ffill()
+                # Backward-fill any leading NaN (benchmark starts later)
+                aligned = aligned.bfill()
+
+                first_val = float(aligned.iloc[0])
+                if first_val == 0:
+                    first_val = 1.0
+                benchmark_curve = (init_cash * aligned / first_val).round(2).tolist()
                 logger.info(
                     f"Benchmark curve from {benchmark_code}, "
                     f"{len(index_closes)} points"
                 )
             else:
-                # Fallback: stock buy-and-hold
-                benchmark_label = "基准(Buy&Hold — 指数数据获取失败)"
-                benchmark_curve = []
-                first_close = float(df.iloc[0]["Close"])
-                for i in range(len(dates)):
-                    bm_val = init_cash * float(df.iloc[i]["Close"]) / first_close
-                    benchmark_curve.append(round(bm_val, 2))
+                # Fallback: flat line at init_cash (0% return)
+                benchmark_label = f"基准(Buy&Hold — {benchmark_code} 数据获取失败)"
+                benchmark_curve = [init_cash] * len(dates)
                 logger.warning(
                     f"Benchmark {benchmark_code} fetch failed, "
-                    f"using stock B&H fallback"
+                    f"using flat line fallback"
                 )
 
             # Create pyecharts line chart
@@ -1007,7 +1003,7 @@ class PanelBacktest(wx.Panel):
 
     def _fetch_benchmark_index(self, benchmark_code, start_time, end_time):
         """Fetch benchmark index close prices for the given date range.
-        Returns list of close prices, or None on failure."""
+        Returns pd.Series with DatetimeIndex, or None on failure."""
         try:
             if benchmark_code == "000300.SH":
                 df = ak.stock_zh_index_daily(symbol="sh000300")
@@ -1027,7 +1023,9 @@ class PanelBacktest(wx.Panel):
                         break
                 if close_col is None:
                     return None
-                return df[close_col].tolist()
+                series = df.set_index(date_col)[close_col]
+                series.index = pd.DatetimeIndex(series.index)
+                return series
 
             elif benchmark_code in ("SPX", "HSI"):
                 ticker_map = {"SPX": "^GSPC", "HSI": "^HSI"}
@@ -1052,7 +1050,10 @@ class PanelBacktest(wx.Panel):
                     close_col = None
                 if close_col is None:
                     return None
-                return df[close_col].tolist()
+                series = df[close_col]
+                # yfinance already provides DatetimeIndex
+                series.index = pd.DatetimeIndex(series.index)
+                return series
 
             return None
         except Exception as e:
