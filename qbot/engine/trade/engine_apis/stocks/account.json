@@ -1,0 +1,8 @@
+{
+    "模拟账户": {
+        "/des": "模拟交易账户配置，用于 Paper Trading",
+        "user": "paper_trading",
+        "password": "paper_trading",
+        "capital": 1000000
+    }
+}
